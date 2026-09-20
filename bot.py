@@ -83,6 +83,9 @@ KNOWN_PLATFORMS = {
 # request_id -> метаданные запроса, ожидающего выбора качества пользователем
 pending_requests: dict[str, dict] = {}
 
+# Админы, от которых сейчас ждём пост для сохранения (после /newpost)
+_awaiting_post: set[int] = set()
+
 
 def detect_platform(url: str) -> str:
     host = urlparse(url).netloc.lower().replace("www.", "")
@@ -286,6 +289,55 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         t(lang, "myid", id=update.effective_user.id), parse_mode="Markdown"
     )
+
+
+def build_post_preview(message) -> str:
+    """Короткое текстовое превью поста для списка в админ-панели."""
+    if message.text:
+        return message.text[:150]
+    if message.caption:
+        prefix = "🖼 " if message.photo else "📎 "
+        return prefix + message.caption[:150]
+    if message.photo:
+        return "🖼 (фото без подписи)"
+    if message.video:
+        return "🎬 (видео)"
+    if message.animation:
+        return "🎞 (gif)"
+    return "(сообщение без текста)"
+
+
+async def cmd_newpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        return
+    lang = get_user_lang(user.id, user.language_code)
+    _awaiting_post.add(user.id)
+    await update.message.reply_text(t(lang, "newpost_prompt"))
+
+
+async def handle_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Единая точка входа для не-командных сообщений: сохранение поста или обработка ссылки."""
+    user = update.effective_user
+    db.touch_user(user.id, user.username)
+
+    if user.id in _awaiting_post and user.id in ADMIN_IDS:
+        _awaiting_post.discard(user.id)
+        lang = get_user_lang(user.id, user.language_code)
+        preview = build_post_preview(update.message)
+        db.add_draft_post(
+            admin_user_id=user.id,
+            chat_id=update.effective_chat.id,
+            message_id=update.message.message_id,
+            preview=preview,
+        )
+        await update.message.reply_text(t(lang, "post_saved"))
+        return
+
+    if update.message.text:
+        await handle_message(update, context)
+    # Прочие типы сообщений (фото/видео без /newpost) молча игнорируем —
+    # бот реагирует только на ссылки и на посты, ожидаемые после /newpost.
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -495,13 +547,14 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("language", language_command))
     app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("newpost", cmd_newpost))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("unban", cmd_unban))
     app.add_handler(CallbackQueryHandler(handle_language_choice, pattern=r"^setlang:"))
     app.add_handler(CallbackQueryHandler(handle_subscription_check, pattern=r"^checksub$"))
     app.add_handler(CallbackQueryHandler(handle_quality_choice, pattern=r"^dl:"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_incoming))
 
     logger.info("Бот запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

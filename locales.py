@@ -33,6 +33,12 @@ TEXTS = {
         "subscribe_check_button": "✅ Я подписался",
         "subscribe_thanks": "Спасибо за подписку! Теперь пришли ссылку 🙂",
         "subscribe_still_missing": "Пока не вижу подписку 🙁 Попробуй ещё раз.",
+        "newpost_prompt": (
+            "Пришли сюда пост, который нужно опубликовать — можно просто переслать "
+            "готовое сообщение (текст, фото с подписью). Форматирование сохранится "
+            "как есть. Я сохраню его, а опубликовать всем можно будет из админ-панели."
+        ),
+        "post_saved": "Пост сохранён ✅ Опубликовать его можно из админ-панели.",
     },
     "en": {
         "welcome": (
@@ -63,6 +69,12 @@ TEXTS = {
         "subscribe_check_button": "✅ I subscribed",
         "subscribe_thanks": "Thanks for subscribing! Now send me a link 🙂",
         "subscribe_still_missing": "I still don't see a subscription 🙁 Try again.",
+        "newpost_prompt": (
+            "Send the post you want published — you can just forward a ready message "
+            "(text, or a photo with a caption). Formatting stays exactly as is. "
+            "I'll save it, and you can publish it to everyone from the admin panel."
+        ),
+        "post_saved": "Post saved ✅ You can publish it from the admin panel.",
     },
 }
 

@@ -66,6 +66,21 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS draft_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_user_id INTEGER,
+                chat_id INTEGER,
+                message_id INTEGER,
+                preview TEXT,
+                created_at TEXT,
+                published INTEGER DEFAULT 0,
+                sent_count INTEGER DEFAULT 0,
+                failed_count INTEGER DEFAULT 0
+            )
+            """
+        )
         # Добавляем колонку language, если база создана более старой версией бота.
         existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
         if "language" not in existing_cols:
@@ -118,6 +133,43 @@ def set_setting(key: str, value: str):
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
         )
+
+
+def add_draft_post(admin_user_id: int, chat_id: int, message_id: int, preview: str) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO draft_posts (admin_user_id, chat_id, message_id, preview, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (admin_user_id, chat_id, message_id, preview, _now()),
+        )
+        return cur.lastrowid
+
+
+def list_draft_posts(limit: int = 50) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM draft_posts ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_draft_post(post_id: int) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM draft_posts WHERE id=?", (post_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def mark_draft_published(post_id: int, sent_count: int, failed_count: int):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE draft_posts SET published=1, sent_count=?, failed_count=? WHERE id=?",
+            (sent_count, failed_count, post_id),
+        )
+
+
+def delete_draft_post(post_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM draft_posts WHERE id=?", (post_id,))
 
 
 def set_banned(user_id: int, banned: bool):

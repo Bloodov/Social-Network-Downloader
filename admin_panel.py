@@ -11,6 +11,7 @@ ADMIN_USER / ADMIN_PASS) — обязательно смените пароль 
 
 import os
 import time
+import html
 import threading
 from functools import wraps
 
@@ -116,6 +117,47 @@ def _send_broadcast(text: str, photo_bytes: bytes | None, photo_filename: str | 
         _broadcast_status["running"] = False
 
 
+# ---------------- Публикация пересланных постов (через /newpost в боте) ----------------
+# Копируем сообщение каждому пользователю через Telegram Bot API copyMessage —
+# это сохраняет форматирование, фото и всё остальное один в один, без искажений.
+
+_publishing_posts: set[int] = set()
+_publishing_lock = threading.Lock()
+
+
+def _publish_draft_post(post_id: int, from_chat_id: int, message_id: int):
+    users = [u for u in db.list_users(limit=1_000_000) if not u["is_banned"]]
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/copyMessage"
+
+    sent = 0
+    failed = 0
+    for u in users:
+        try:
+            resp = requests.post(
+                url,
+                data={
+                    "chat_id": u["user_id"],
+                    "from_chat_id": from_chat_id,
+                    "message_id": message_id,
+                },
+                timeout=15,
+            )
+            ok = resp.ok and resp.json().get("ok")
+        except Exception:
+            ok = False
+
+        if ok:
+            sent += 1
+        else:
+            failed += 1
+
+        time.sleep(BROADCAST_DELAY_SECONDS)
+
+    db.mark_draft_published(post_id, sent, failed)
+    with _publishing_lock:
+        _publishing_posts.discard(post_id)
+
+
 def _check_auth(username: str, password: str) -> bool:
     return username == ADMIN_USER and password == ADMIN_PASS
 
@@ -208,6 +250,7 @@ PAGE_TEMPLATE = """
       <button type="button" data-cmd="pre" title="Блок кода">{{ }}</button>
       <button type="button" data-cmd="quote" title="Цитата">❝</button>
       <button type="button" data-cmd="link" title="Ссылка">🔗</button>
+      <button type="button" data-cmd="clear" title="Очистить форматирование">🧹</button>
     </div>
     <div id="richEditor" class="rich-editor" contenteditable="true"
          data-placeholder="Текст сообщения... выдели текст и нажми кнопку форматирования"
@@ -225,6 +268,17 @@ PAGE_TEMPLATE = """
     </p>
   </form>
   <p style="color:#9aa0aa; font-size:13px;">{broadcast_status_line}</p>
+
+  <h2>📝 Посты на публикацию (переслали боту через /newpost)</h2>
+  <p style="color:#9aa0aa; font-size:13px; max-width:520px;">
+    Отправь боту команду <code>/newpost</code> с аккаунта админа, затем перешли
+    готовый пост (текст и/или фото с подписью) — форматирование Telegram сохранится
+    без искажений. Пост появится здесь, публикуй кнопкой ниже.
+  </p>
+  <table>
+    <tr><th>Создан (UTC)</th><th>Превью</th><th>Статус</th><th>Действия</th></tr>
+    {draft_post_rows}
+  </table>
 
   <h2>🔒 Обязательная подписка на канал</h2>
   <p style="color:#9aa0aa; font-size:13px; max-width:520px;">
@@ -302,6 +356,9 @@ PAGE_TEMPLATE = """
           case 'link':
             var url = window.prompt('Ссылка (https://...)');
             if (url) wrapSelection('a', {{'href': url}});
+            break;
+          case 'clear':
+            document.execCommand('removeFormat');
             break;
         }}
       }});
@@ -415,6 +472,35 @@ def dashboard():
         )
     download_rows = "".join(rows_html) or "<tr><td colspan=5>Пока нет данных</td></tr>"
 
+    posts = db.list_draft_posts(50)
+    with _publishing_lock:
+        publishing_now = set(_publishing_posts)
+    post_rows_html = []
+    for p in posts:
+        ts = p["created_at"].replace("T", " ")[:19]
+        preview = html.escape(p["preview"] or "")
+        if p["id"] in publishing_now:
+            status = "⏳ Публикуется..."
+            actions = ""
+        elif p["published"]:
+            status = f"✅ Опубликовано ({p['sent_count']}/{p['sent_count'] + p['failed_count']})"
+            actions = (
+                f'<form class="inline" method="post" action="/delete_post/{p["id"]}">'
+                f'<button class="danger" type="submit">Удалить</button></form>'
+            )
+        else:
+            status = "🕓 Ждёт публикации"
+            actions = (
+                f'<form class="inline" method="post" action="/publish_post/{p["id"]}">'
+                f'<button type="submit">Опубликовать</button></form>'
+                f'<form class="inline" method="post" action="/delete_post/{p["id"]}">'
+                f'<button class="danger" type="submit">Удалить</button></form>'
+            )
+        post_rows_html.append(
+            f"<tr><td>{ts}</td><td>{preview}</td><td>{status}</td><td>{actions}</td></tr>"
+        )
+    draft_post_rows = "".join(post_rows_html) or "<tr><td colspan=4>Постов пока нет</td></tr>"
+
     with _broadcast_lock:
         bs = dict(_broadcast_status)
 
@@ -430,19 +516,20 @@ def dashboard():
 
     required_channel = db.get_setting("required_channel", "") or ""
 
-    html = PAGE_TEMPLATE.format(
+    html_page = PAGE_TEMPLATE.format(
         total_users=stats["total_users"],
         total_downloads=stats["total_downloads"],
         failed_downloads=stats["failed_downloads"],
         banned_users=stats["banned_users"],
         platform_rows=platform_rows,
         download_rows=download_rows,
+        draft_post_rows=draft_post_rows,
         broadcast_status_line=status_line,
         disabled_attr=disabled_attr,
         last_text="",
         required_channel=required_channel,
     )
-    return html
+    return html_page
 
 
 @app.route("/broadcast", methods=["POST"])
@@ -479,6 +566,31 @@ def broadcast_status():
 def settings():
     channel = request.form.get("required_channel", "").strip()
     db.set_setting("required_channel", channel)
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/publish_post/<int:post_id>", methods=["POST"])
+@requires_auth
+def publish_post(post_id):
+    post = db.get_draft_post(post_id)
+    if post and not post["published"]:
+        with _publishing_lock:
+            already = post_id in _publishing_posts
+            if not already:
+                _publishing_posts.add(post_id)
+        if not already:
+            threading.Thread(
+                target=_publish_draft_post,
+                args=(post_id, post["chat_id"], post["message_id"]),
+                daemon=True,
+            ).start()
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/delete_post/<int:post_id>", methods=["POST"])
+@requires_auth
+def delete_post(post_id):
+    db.delete_draft_post(post_id)
     return redirect(url_for("dashboard"))
 
 
