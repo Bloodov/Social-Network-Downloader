@@ -310,40 +310,73 @@ PAGE_TEMPLATE = """
         return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
       }}
 
-      function nodeToTelegramHtml(node) {{
-        if (node.nodeType === Node.TEXT_NODE) {{
-          return escapeHtml(node.textContent);
-        }}
-        if (node.nodeType !== Node.ELEMENT_NODE) return '';
-
-        var tag = node.tagName.toLowerCase();
-        var inner = Array.prototype.map.call(node.childNodes, nodeToTelegramHtml).join('');
-
-        switch (tag) {{
-          case 'b': case 'strong': return '<b>' + inner + '</b>';
-          case 'i': case 'em': return '<i>' + inner + '</i>';
-          case 'u': return '<u>' + inner + '</u>';
-          case 's': case 'strike': case 'del': return '<s>' + inner + '</s>';
-          case 'code': return '<code>' + inner + '</code>';
-          case 'pre': return '<pre>' + inner + '</pre>';
-          case 'blockquote': return '<blockquote>' + inner + '</blockquote>';
-          case 'a':
-            var href = node.getAttribute('href') || '';
-            return '<a href="' + escapeHtml(href) + '">' + inner + '</a>';
-          case 'span':
-            if (node.classList.contains('tg-spoiler')) {{
-              return '<span class="tg-spoiler">' + inner + '</span>';
-            }}
-            return inner;
-          case 'div': case 'p': return inner + '\\n';
-          case 'br': return '\\n';
-          default: return inner;
-        }}
-      }}
-
+      // Строим результат построчно: инлайновые элементы (b, i, a...) добавляются
+      // к текущей строке, а <div>/<p>/<br> всегда начинают новую строку.
+      // Это нужно, чтобы не терять перенос строки между первой строкой (она в
+      // contenteditable лежит как обычный текстовый узел без обёртки) и
+      // следующими строками, которые браузер оборачивает в <div> после Enter.
       function editorToTelegramHtml() {{
-        var result = Array.prototype.map.call(editor.childNodes, nodeToTelegramHtml).join('');
-        return result.replace(/\\n+$/, '');
+        var lines = [''];
+
+        function appendToCurrentLine(str) {{
+          lines[lines.length - 1] += str;
+        }}
+
+        function newLineIfNeeded() {{
+          if (lines[lines.length - 1] !== '') lines.push('');
+        }}
+
+        function walk(node) {{
+          if (node.nodeType === Node.TEXT_NODE) {{
+            appendToCurrentLine(escapeHtml(node.textContent));
+            return;
+          }}
+          if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+          var tag = node.tagName.toLowerCase();
+
+          if (tag === 'br') {{
+            lines.push('');
+            return;
+          }}
+          if (tag === 'div' || tag === 'p') {{
+            newLineIfNeeded();
+            Array.prototype.forEach.call(node.childNodes, walk);
+            newLineIfNeeded();
+            return;
+          }}
+
+          var open = '', close = '';
+          switch (tag) {{
+            case 'b': case 'strong': open = '<b>'; close = '</b>'; break;
+            case 'i': case 'em': open = '<i>'; close = '</i>'; break;
+            case 'u': open = '<u>'; close = '</u>'; break;
+            case 's': case 'strike': case 'del': open = '<s>'; close = '</s>'; break;
+            case 'code': open = '<code>'; close = '</code>'; break;
+            case 'pre': open = '<pre>'; close = '</pre>'; break;
+            case 'blockquote': open = '<blockquote>'; close = '</blockquote>'; break;
+            case 'a':
+              var href = node.getAttribute('href') || '';
+              open = '<a href="' + escapeHtml(href) + '">';
+              close = '</a>';
+              break;
+            case 'span':
+              if (node.classList.contains('tg-spoiler')) {{
+                open = '<span class="tg-spoiler">';
+                close = '</span>';
+              }}
+              break;
+          }}
+
+          appendToCurrentLine(open);
+          Array.prototype.forEach.call(node.childNodes, walk);
+          appendToCurrentLine(close);
+        }}
+
+        Array.prototype.forEach.call(editor.childNodes, walk);
+
+        while (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+        return lines.join('\\n');
       }}
 
       form.addEventListener('submit', function() {{
