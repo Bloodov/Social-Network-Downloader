@@ -25,6 +25,7 @@ ADMIN_PASS = os.environ.get("ADMIN_PASS", "change_me")
 PORT = int(os.environ.get("PORT", "8080"))
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # лимит загрузки фото — 10 МБ
 
 # ---------------- Рассылка сообщений всем пользователям ----------------
 # Отправка идёт напрямую через Telegram Bot HTTP API (без python-telegram-bot),
@@ -37,22 +38,69 @@ _broadcast_lock = threading.Lock()
 # чтобы не словить 429 Too Many Requests при большой базе пользователей.
 BROADCAST_DELAY_SECONDS = float(os.environ.get("BROADCAST_DELAY_SECONDS", "0.05"))
 
+# Лимит подписи к фото в Telegram
+CAPTION_LIMIT = 1024
 
-def _send_broadcast(text: str):
+
+def _send_broadcast(text: str, photo_bytes: bytes | None, photo_filename: str | None):
     users = [u for u in db.list_users(limit=1_000_000) if not u["is_banned"]]
 
     with _broadcast_lock:
         _broadcast_status.update(running=True, sent=0, failed=0, total=len(users), last_text=text)
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    send_photo_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    send_message_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+    # Если текст короткий — он идёт подписью к фото; если длинный — фото без подписи
+    # плюс отдельное сообщение с текстом сразу следом (у подписи лимит 1024 символа).
+    caption = text if (photo_bytes and text and len(text) <= CAPTION_LIMIT) else None
+    trailing_text = text if (photo_bytes and text and len(text) > CAPTION_LIMIT) else None
+
+    # После первой успешной отправки фото Telegram отдаёт file_id — дальше
+    # рассылаем по file_id, без повторной загрузки файла на каждого пользователя.
+    file_id = None
+
     for u in users:
         try:
-            resp = requests.post(
-                url,
-                data={"chat_id": u["user_id"], "text": text},
-                timeout=10,
-            )
-            ok = resp.ok and resp.json().get("ok")
+            ok = True
+            if photo_bytes:
+                data = {"chat_id": u["user_id"]}
+                if caption:
+                    data["caption"] = caption
+                    data["parse_mode"] = "HTML"
+
+                if file_id:
+                    data["photo"] = file_id
+                    resp = requests.post(send_photo_url, data=data, timeout=15)
+                else:
+                    resp = requests.post(
+                        send_photo_url,
+                        data=data,
+                        files={"photo": (photo_filename or "photo.jpg", photo_bytes)},
+                        timeout=30,
+                    )
+
+                payload = resp.json()
+                ok = resp.ok and payload.get("ok")
+                if ok and not file_id:
+                    sizes = (payload.get("result") or {}).get("photo") or []
+                    if sizes:
+                        file_id = sizes[-1]["file_id"]
+
+                if ok and trailing_text:
+                    resp2 = requests.post(
+                        send_message_url,
+                        data={"chat_id": u["user_id"], "text": trailing_text, "parse_mode": "HTML"},
+                        timeout=10,
+                    )
+                    ok = ok and resp2.ok and resp2.json().get("ok")
+            else:
+                resp = requests.post(
+                    send_message_url,
+                    data={"chat_id": u["user_id"], "text": text, "parse_mode": "HTML"},
+                    timeout=10,
+                )
+                ok = resp.ok and resp.json().get("ok")
         except Exception:
             ok = False
 
@@ -115,6 +163,22 @@ PAGE_TEMPLATE = """
     button {{ background:#2f6fed; color:white; border:none; padding:6px 12px;
               border-radius:6px; cursor:pointer; }}
     button.danger {{ background:#b3313b; }}
+    .toolbar {{ display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; max-width:520px; }}
+    .toolbar button {{ background:#1a1d24; border:1px solid #333; color:#eee;
+                        min-width:36px; padding:6px 10px; font-size:14px; }}
+    .toolbar button:hover {{ background:#262a33; }}
+    .rich-editor {{ width:100%; max-width:520px; min-height:120px; background:#1a1d24;
+                     border:1px solid #333; color:#eee; padding:10px; border-radius:6px;
+                     font-family:inherit; font-size:14px; line-height:1.5; white-space:pre-wrap; }}
+    .rich-editor:empty:before {{ content: attr(data-placeholder); color:#666; }}
+    .rich-editor b {{ font-weight:700; }}
+    .rich-editor .tg-spoiler {{ background:#333; border-radius:3px; padding:0 2px; }}
+    .rich-editor code {{ background:#0f1115; padding:1px 4px; border-radius:4px; font-family:monospace; }}
+    .rich-editor pre {{ background:#0f1115; padding:8px; border-radius:6px; overflow-x:auto;
+                         font-family:monospace; }}
+    .rich-editor blockquote {{ border-left:3px solid #2f6fed; margin:4px 0; padding-left:10px;
+                                color:#c7cbd1; }}
+    .rich-editor a {{ color:#6ea8fe; }}
   </style>
 </head>
 <body>
@@ -133,11 +197,32 @@ PAGE_TEMPLATE = """
   </table>
 
   <h2>📢 Рассылка всем пользователям (не забаненным)</h2>
-  <form method="post" action="/broadcast">
-    <textarea name="message" rows="4" style="width:100%; max-width:520px; background:#1a1d24;
-      border:1px solid #333; color:#eee; padding:8px; border-radius:6px; font-family:inherit;"
-      placeholder="Текст сообщения..." {disabled_attr}>{last_text}</textarea><br><br>
+  <form method="post" action="/broadcast" enctype="multipart/form-data" id="broadcastForm">
+    <div class="toolbar" id="toolbar">
+      <button type="button" data-cmd="bold" title="Жирный"><b>B</b></button>
+      <button type="button" data-cmd="italic" title="Курсив"><i>I</i></button>
+      <button type="button" data-cmd="underline" title="Подчёркнутый"><u>U</u></button>
+      <button type="button" data-cmd="strike" title="Зачёркнутый"><s>S</s></button>
+      <button type="button" data-cmd="spoiler" title="Спойлер">🙈</button>
+      <button type="button" data-cmd="code" title="Код (строка)">&lt;/&gt;</button>
+      <button type="button" data-cmd="pre" title="Блок кода">{{ }}</button>
+      <button type="button" data-cmd="quote" title="Цитата">❝</button>
+      <button type="button" data-cmd="link" title="Ссылка">🔗</button>
+    </div>
+    <div id="richEditor" class="rich-editor" contenteditable="true"
+         data-placeholder="Текст сообщения... выдели текст и нажми кнопку форматирования"
+         {disabled_attr}></div>
+    <input type="hidden" name="message" id="messageHidden">
+    <br>
+    <label style="color:#9aa0aa; font-size:13px;">Фото (необязательно):</label><br>
+    <input type="file" name="photo" accept="image/*" {disabled_attr}><br><br>
     <button type="submit" {disabled_attr}>Отправить всем</button>
+    <p style="color:#9aa0aa; font-size:12px; max-width:520px; line-height:1.5;">
+      Выдели текст в поле выше и нажми кнопку на панели, чтобы применить форматирование
+      Telegram (жирный, курсив, подчёркнутый, зачёркнутый, спойлер, код, блок кода, цитата, ссылка).
+      Если прикреплено фото — текст станет подписью к нему (лимит подписи — 1024 символа,
+      более длинный текст придёт отдельным сообщением сразу после фото).
+    </p>
   </form>
   <p style="color:#9aa0aa; font-size:13px;">{broadcast_status_line}</p>
 
@@ -168,6 +253,104 @@ PAGE_TEMPLATE = """
     <tr><th>Время (UTC)</th><th>Пользователь</th><th>Платформа</th><th>Качество</th><th>Статус</th></tr>
     {download_rows}
   </table>
+
+  <script>
+    (function() {{
+      var editor = document.getElementById('richEditor');
+      var toolbar = document.getElementById('toolbar');
+      var form = document.getElementById('broadcastForm');
+      var hidden = document.getElementById('messageHidden');
+      if (!editor || !toolbar || !form) return;
+
+      function wrapSelection(tagName, attrs) {{
+        var sel = window.getSelection();
+        if (!sel.rangeCount || sel.isCollapsed) return;
+        var range = sel.getRangeAt(0);
+        var el = document.createElement(tagName);
+        if (attrs) {{
+          Object.keys(attrs).forEach(function(k) {{ el.setAttribute(k, attrs[k]); }});
+        }}
+        try {{
+          range.surroundContents(el);
+        }} catch (e) {{
+          var content = range.extractContents();
+          el.appendChild(content);
+          range.insertNode(el);
+        }}
+        sel.removeAllRanges();
+      }}
+
+      toolbar.addEventListener('mousedown', function(e) {{
+        // Не даём полю потерять фокус/выделение при клике по кнопке
+        e.preventDefault();
+      }});
+
+      toolbar.addEventListener('click', function(e) {{
+        var btn = e.target.closest('button[data-cmd]');
+        if (!btn) return;
+        editor.focus();
+        var cmd = btn.getAttribute('data-cmd');
+        switch (cmd) {{
+          case 'bold': document.execCommand('bold'); break;
+          case 'italic': document.execCommand('italic'); break;
+          case 'underline': document.execCommand('underline'); break;
+          case 'strike': document.execCommand('strikeThrough'); break;
+          case 'spoiler': wrapSelection('span', {{'class': 'tg-spoiler'}}); break;
+          case 'code': wrapSelection('code'); break;
+          case 'pre': wrapSelection('pre'); break;
+          case 'quote': wrapSelection('blockquote'); break;
+          case 'link':
+            var url = window.prompt('Ссылка (https://...)');
+            if (url) wrapSelection('a', {{'href': url}});
+            break;
+        }}
+      }});
+
+      function escapeHtml(text) {{
+        return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      }}
+
+      function nodeToTelegramHtml(node) {{
+        if (node.nodeType === Node.TEXT_NODE) {{
+          return escapeHtml(node.textContent);
+        }}
+        if (node.nodeType !== Node.ELEMENT_NODE) return '';
+
+        var tag = node.tagName.toLowerCase();
+        var inner = Array.prototype.map.call(node.childNodes, nodeToTelegramHtml).join('');
+
+        switch (tag) {{
+          case 'b': case 'strong': return '<b>' + inner + '</b>';
+          case 'i': case 'em': return '<i>' + inner + '</i>';
+          case 'u': return '<u>' + inner + '</u>';
+          case 's': case 'strike': case 'del': return '<s>' + inner + '</s>';
+          case 'code': return '<code>' + inner + '</code>';
+          case 'pre': return '<pre>' + inner + '</pre>';
+          case 'blockquote': return '<blockquote>' + inner + '</blockquote>';
+          case 'a':
+            var href = node.getAttribute('href') || '';
+            return '<a href="' + escapeHtml(href) + '">' + inner + '</a>';
+          case 'span':
+            if (node.classList.contains('tg-spoiler')) {{
+              return '<span class="tg-spoiler">' + inner + '</span>';
+            }}
+            return inner;
+          case 'div': case 'p': return inner + '\\n';
+          case 'br': return '\\n';
+          default: return inner;
+        }}
+      }}
+
+      function editorToTelegramHtml() {{
+        var result = Array.prototype.map.call(editor.childNodes, nodeToTelegramHtml).join('');
+        return result.replace(/\\n+$/, '');
+      }}
+
+      form.addEventListener('submit', function() {{
+        hidden.value = editorToTelegramHtml();
+      }});
+    }})();
+  </script>
 </body>
 </html>
 """
@@ -233,10 +416,21 @@ def dashboard():
 @requires_auth
 def broadcast():
     text = request.form.get("message", "").strip()
+
+    photo_bytes = None
+    photo_filename = None
+    photo_file = request.files.get("photo")
+    if photo_file and photo_file.filename:
+        photo_bytes = photo_file.read()
+        photo_filename = photo_file.filename
+
     with _broadcast_lock:
         already_running = _broadcast_status["running"]
-    if text and not already_running:
-        threading.Thread(target=_send_broadcast, args=(text,), daemon=True).start()
+
+    if (text or photo_bytes) and not already_running:
+        threading.Thread(
+            target=_send_broadcast, args=(text, photo_bytes, photo_filename), daemon=True
+        ).start()
     return redirect(url_for("dashboard"))
 
 
