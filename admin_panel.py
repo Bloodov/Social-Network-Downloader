@@ -141,6 +141,18 @@ PAGE_TEMPLATE = """
   </form>
   <p style="color:#9aa0aa; font-size:13px;">{broadcast_status_line}</p>
 
+  <h2>🔒 Обязательная подписка на канал</h2>
+  <p style="color:#9aa0aa; font-size:13px; max-width:520px;">
+    Если поле заполнено — бот не даст скачивать, пока пользователь не подпишется
+    на указанный канал. Укажи юзернейм вида <code>@channel</code> или пусто, чтобы
+    отключить проверку. Бота нужно добавить в канал администратором, иначе
+    проверка подписки не сработает.
+  </p>
+  <form method="post" action="/settings">
+    <input type="text" name="required_channel" value="{required_channel}" placeholder="@channel">
+    <button type="submit">Сохранить</button>
+  </form>
+
   <h2>Забанить / разбанить пользователя</h2>
   <form class="inline" method="post" action="/ban">
     <input type="text" name="user_id" placeholder="ID пользователя">
@@ -200,6 +212,8 @@ def dashboard():
         status_line = "Рассылок ещё не было."
         disabled_attr = ""
 
+    required_channel = db.get_setting("required_channel", "") or ""
+
     html = PAGE_TEMPLATE.format(
         total_users=stats["total_users"],
         total_downloads=stats["total_downloads"],
@@ -210,6 +224,7 @@ def dashboard():
         broadcast_status_line=status_line,
         disabled_attr=disabled_attr,
         last_text="",
+        required_channel=required_channel,
     )
     return html
 
@@ -230,6 +245,14 @@ def broadcast():
 def broadcast_status():
     with _broadcast_lock:
         return dict(_broadcast_status)
+
+
+@app.route("/settings", methods=["POST"])
+@requires_auth
+def settings():
+    channel = request.form.get("required_channel", "").strip()
+    db.set_setting("required_channel", channel)
+    return redirect(url_for("dashboard"))
 
 
 @app.route("/ban", methods=["POST"])

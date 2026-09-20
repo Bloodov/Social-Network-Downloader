@@ -39,6 +39,7 @@ from telegram.ext import (
 import database as db
 from admin_panel import run_admin_panel_in_thread
 from config import BOT_TOKEN, ADMIN_IDS
+from locales import t
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -91,7 +92,72 @@ def detect_platform(url: str) -> str:
     return "other"
 
 
-def check_rate_limit(user_id: int) -> str | None:
+def get_user_lang(user_id: int, telegram_language_code: str | None = None) -> str:
+    """Язык пользователя: сохранённый выбор, иначе эвристика по языку Telegram-клиента."""
+    saved = db.get_language(user_id)
+    if saved:
+        return saved
+    if telegram_language_code and telegram_language_code.lower().startswith("ru"):
+        return "ru"
+    return "en"
+
+
+def language_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🇷🇺 Русский", callback_data="setlang:ru"),
+            InlineKeyboardButton("🇬🇧 English", callback_data="setlang:en"),
+        ]
+    ])
+
+
+# ---------------- Обязательная подписка на канал ----------------
+
+REQUIRED_CHANNEL_SETTING_KEY = "required_channel"
+
+
+def get_required_channel() -> str | None:
+    """Юзернейм/ID канала (например, @mychannel) из настроек админ-панели, либо None, если отключено."""
+    value = db.get_setting(REQUIRED_CHANNEL_SETTING_KEY, "")
+    value = (value or "").strip()
+    return value or None
+
+
+async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int, channel: str) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id=channel, user_id=user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception as e:
+        # Если проверить не получилось (например, бот не добавлен админом в канал),
+        # не блокируем всех пользователей из-за неправильной настройки — пропускаем,
+        # но громко логируем, чтобы админ заметил и поправил канал в панели.
+        logger.warning("Subscription check failed for user %s, channel %s: %s", user_id, channel, e)
+        return True
+
+
+def subscribe_keyboard(lang: str, channel: str) -> InlineKeyboardMarkup:
+    channel_username = channel.lstrip("@")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(t(lang, "subscribe_button"), url=f"https://t.me/{channel_username}")],
+        [InlineKeyboardButton(t(lang, "subscribe_check_button"), callback_data="checksub")],
+    ])
+
+
+async def handle_subscription_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+    lang = get_user_lang(user.id, user.language_code)
+
+    channel = get_required_channel()
+    if not channel or await is_subscribed(context, user.id, channel):
+        await query.answer(t(lang, "subscribe_thanks"), show_alert=True)
+        await query.delete_message()
+        return
+
+    await query.answer(t(lang, "subscribe_still_missing"), show_alert=True)
+
+
+def check_rate_limit(user_id: int, lang: str) -> str | None:
     """None — можно скачивать, иначе возвращает текст с причиной отказа."""
     if user_id in ADMIN_IDS:
         return None
@@ -99,14 +165,13 @@ def check_rate_limit(user_id: int) -> str | None:
     now = time.time()
     last = _last_request_at.get(user_id, 0)
     if now - last < COOLDOWN_SECONDS:
-        wait = int(COOLDOWN_SECONDS - (now - last))
-        return f"⏳ Подожди {wait} сек. перед следующим запросом."
+        return t(lang, "cooldown")
 
     q = _hourly_requests[user_id]
     while q and now - q[0] > 3600:
         q.popleft()
     if len(q) >= MAX_DOWNLOADS_PER_HOUR:
-        return f"🚫 Лимит {MAX_DOWNLOADS_PER_HOUR} скачиваний в час исчерпан. Попробуй позже."
+        return t(lang, "hourly_limit")
 
     return None
 
@@ -131,7 +196,7 @@ def _extract_info_sync(url: str) -> dict:
         return ydl.extract_info(url, download=False)
 
 
-def _pick_quality_options(info: dict) -> list[tuple[str, str]]:
+def _pick_quality_options(info: dict, lang: str) -> list[tuple[str, str]]:
     """Список (подпись_кнопки, format_selector) для показа пользователю."""
     formats = info.get("formats") or []
     heights = sorted({f.get("height") for f in formats if f.get("height")}, reverse=True)
@@ -150,9 +215,11 @@ def _pick_quality_options(info: dict) -> list[tuple[str, str]]:
         for h in chosen_heights
     ]
     if not options:
-        options.append(("🎬 Лучшее качество", "bestvideo+bestaudio/best"))
+        best_label = "🎬 Лучшее качество" if lang == "ru" else "🎬 Best quality"
+        options.append((best_label, "bestvideo+bestaudio/best"))
 
-    options.append(("🎵 Только аудио (mp3)", "bestaudio/best"))
+    audio_label = "🎵 Только аудио (mp3)" if lang == "ru" else "🎵 Audio only (mp3)"
+    options.append((audio_label, "bestaudio/best"))
     return options
 
 
@@ -186,69 +253,96 @@ def _download_sync(url: str, fmt: str, out_template: str, audio_only: bool) -> s
 # ---------------- Handlers ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db.touch_user(update.effective_user.id, update.effective_user.username)
-    await update.message.reply_text(
-        "Привет! Пришли ссылку на видео (YouTube, TikTok, Instagram, Twitter/X, VK, "
-        "Facebook, Pinterest, Reddit, Twitch, SoundCloud, Vimeo и другие) — предложу "
-        "качество и скачаю.\n\n"
-        "TikTok — без водяного знака."
-    )
+    user = update.effective_user
+    db.touch_user(user.id, user.username)
+
+    saved_lang = db.get_language(user.id)
+    if saved_lang:
+        await update.message.reply_text(t(saved_lang, "welcome"))
+    else:
+        # Первый запуск — просим выбрать язык, приветствие покажем после выбора.
+        await update.message.reply_text(
+            "Выбери язык / Choose your language:",
+            reply_markup=language_keyboard(),
+        )
+
+
+async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = get_user_lang(update.effective_user.id, update.effective_user.language_code)
+    await update.message.reply_text(t(lang, "choose_language"), reply_markup=language_keyboard())
+
+
+async def handle_language_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    _, lang = query.data.split(":")
+    db.set_language(update.effective_user.id, lang)
+    await query.edit_message_text(t(lang, "language_set") + "\n\n" + t(lang, "welcome"))
 
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Твой Telegram ID: `{update.effective_user.id}`", parse_mode="Markdown")
+    lang = get_user_lang(update.effective_user.id, update.effective_user.language_code)
+    await update.message.reply_text(
+        t(lang, "myid", id=update.effective_user.id), parse_mode="Markdown"
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db.touch_user(user.id, user.username)
+    lang = get_user_lang(user.id, user.language_code)
 
     if db.is_banned(user.id):
-        await update.message.reply_text("🚫 Тебе закрыт доступ к боту.")
+        await update.message.reply_text(t(lang, "banned"))
+        return
+
+    channel = get_required_channel()
+    if channel and not await is_subscribed(context, user.id, channel):
+        await update.message.reply_text(
+            t(lang, "subscribe_required", channel=channel),
+            reply_markup=subscribe_keyboard(lang, channel),
+        )
         return
 
     text = update.message.text or ""
     match = URL_RE.search(text)
     if not match:
-        await update.message.reply_text("Пришли, пожалуйста, ссылку на видео.")
+        await update.message.reply_text(t(lang, "send_link"))
         return
     url = match.group(0)
 
-    limit_error = check_rate_limit(user.id)
+    limit_error = check_rate_limit(user.id, lang)
     if limit_error:
         await update.message.reply_text(limit_error)
         return
 
-    status_msg = await update.message.reply_text("🔎 Проверяю ссылку...")
+    status_msg = await update.message.reply_text(t(lang, "checking_link"))
 
     try:
         loop = asyncio.get_running_loop()
         info = await loop.run_in_executor(None, _extract_info_sync, url)
     except Exception as e:
         logger.warning("Extract failed for %s: %s", url, e)
-        await status_msg.edit_text(
-            "❌ Не удалось распознать ссылку. Либо сайт не поддерживается, "
-            "либо видео приватное/удалено."
-        )
+        await status_msg.edit_text(t(lang, "unsupported_link"))
         return
 
     duration = info.get("duration") or 0
     if duration and duration > MAX_VIDEO_DURATION:
-        await status_msg.edit_text(
-            f"⚠️ Видео длиннее {MAX_VIDEO_DURATION // 60} минут — бот не скачивает такие "
-            "ролики, чтобы не перегружать сервер."
-        )
+        await status_msg.edit_text(t(lang, "too_long"))
         return
 
-    options = _pick_quality_options(info)
+    options = _pick_quality_options(info, lang)
     request_id = uuid.uuid4().hex[:10]
+    title = info.get("title") or ("Видео" if lang == "ru" else "Video")
     pending_requests[request_id] = {
         "url": url,
         "user_id": user.id,
         "chat_id": update.effective_chat.id,
         "platform": detect_platform(url),
-        "title": info.get("title") or "Видео",
+        "title": title,
         "options": options,
+        "lang": lang,
     }
 
     keyboard = [
@@ -257,7 +351,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     await status_msg.edit_text(
-        f"🎞 {pending_requests[request_id]['title']}\n\nВыбери качество:",
+        t(lang, "choose_quality", title=title),
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -266,33 +360,37 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
 
+    fallback_lang = get_user_lang(update.effective_user.id, update.effective_user.language_code)
+
     try:
         _, request_id, idx_str = query.data.split(":")
         idx = int(idx_str)
     except ValueError:
-        await query.edit_message_text("❌ Запрос устарел, пришли ссылку заново.")
+        await query.edit_message_text(t(fallback_lang, "request_expired"))
         return
 
     req = pending_requests.get(request_id)
     if not req:
-        await query.edit_message_text("❌ Запрос устарел, пришли ссылку заново.")
+        await query.edit_message_text(t(fallback_lang, "request_expired"))
         return
 
+    lang = req["lang"]
+
     if req["user_id"] != update.effective_user.id:
-        await query.answer("Это не твой запрос", show_alert=True)
+        await query.answer(t(lang, "not_your_request"), show_alert=True)
         return
 
     label, fmt = req["options"][idx]
-    is_audio = "аудио" in label.lower()
+    is_audio = t(lang, "quality_audio_marker") in label.lower()
 
-    limit_error = check_rate_limit(req["user_id"])
+    limit_error = check_rate_limit(req["user_id"], lang)
     if limit_error:
         await query.edit_message_text(limit_error)
         pending_requests.pop(request_id, None)
         return
 
     register_request(req["user_id"])
-    await query.edit_message_text(f"⏳ Скачиваю ({label})... Если сервер занят — подожди немного.")
+    await query.edit_message_text(t(lang, "downloading"))
 
     file_path = None
     async with _download_semaphore:
@@ -306,7 +404,7 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.exception("Download failed: %s", req["url"])
             db.log_download(req["user_id"], req["platform"], req["url"], label, "error")
-            await query.edit_message_text(f"❌ Не удалось скачать: {e}")
+            await query.edit_message_text(t(lang, "download_error"))
             pending_requests.pop(request_id, None)
             return
 
@@ -314,13 +412,10 @@ async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TY
         size = os.path.getsize(file_path)
         if size > MAX_TELEGRAM_FILE_SIZE:
             db.log_download(req["user_id"], req["platform"], req["url"], label, "too_large")
-            await query.edit_message_text(
-                "⚠️ Файл больше 50 МБ — обычный Bot API не может его отправить. "
-                "Попробуй выбрать качество ниже."
-            )
+            await query.edit_message_text(t(lang, "too_large"))
             return
 
-        await query.edit_message_text("📤 Отправляю...")
+        await query.edit_message_text(t(lang, "sending"))
         with open(file_path, "rb") as f:
             if is_audio:
                 await context.bot.send_audio(chat_id=req["chat_id"], audio=f, title=req["title"])
@@ -398,10 +493,13 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("language", language_command))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("unban", cmd_unban))
+    app.add_handler(CallbackQueryHandler(handle_language_choice, pattern=r"^setlang:"))
+    app.add_handler(CallbackQueryHandler(handle_subscription_check, pattern=r"^checksub$"))
     app.add_handler(CallbackQueryHandler(handle_quality_choice, pattern=r"^dl:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

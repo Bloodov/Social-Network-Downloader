@@ -58,6 +58,18 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+        # Добавляем колонку language, если база создана более старой версией бота.
+        existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+        if "language" not in existing_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN language TEXT")
 
 
 def _now() -> str:
@@ -80,6 +92,32 @@ def is_banned(user_id: int) -> bool:
     with get_conn() as conn:
         row = conn.execute("SELECT is_banned FROM users WHERE user_id=?", (user_id,)).fetchone()
         return bool(row and row["is_banned"])
+
+
+def get_language(user_id: int) -> str | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT language FROM users WHERE user_id=?", (user_id,)).fetchone()
+        return row["language"] if row else None
+
+
+def set_language(user_id: int, language: str):
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET language=? WHERE user_id=?", (language, user_id))
+
+
+def get_setting(key: str, default: str | None = None) -> str | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def set_setting(key: str, value: str):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
 
 
 def set_banned(user_id: int, banned: bool):
