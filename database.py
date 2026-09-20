@@ -135,7 +135,7 @@ def set_setting(key: str, value: str):
         )
 
 
-def add_draft_post(admin_user_id: int, chat_id: int, message_id: int, preview: str) -> int:
+def add_draft_post(chat_id: int, message_id: int, preview: str, admin_user_id: int | None = None) -> int:
     with get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO draft_posts (admin_user_id, chat_id, message_id, preview, created_at) "

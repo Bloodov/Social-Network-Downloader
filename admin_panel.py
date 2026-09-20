@@ -118,8 +118,10 @@ def _send_broadcast(text: str, photo_bytes: bytes | None, photo_filename: str | 
 
 
 # ---------------- Публикация пересланных постов (через /newpost в боте) ----------------
-# Копируем сообщение каждому пользователю через Telegram Bot API copyMessage —
-# это сохраняет форматирование, фото и всё остальное один в один, без искажений.
+# Пересылаем сообщение каждому пользователю через Telegram Bot API forwardMessage
+# (а не copyMessage) — это буквально пересылка исходного сообщения, а не его
+# пересборка ботом заново, поэтому премиум-эмодзи сохраняются как есть.
+# Обратная сторона: у пользователей будет видна пометка "Переслано от...".
 
 _publishing_posts: set[int] = set()
 _publishing_lock = threading.Lock()
@@ -127,7 +129,7 @@ _publishing_lock = threading.Lock()
 
 def _publish_draft_post(post_id: int, from_chat_id: int, message_id: int):
     users = [u for u in db.list_users(limit=1_000_000) if not u["is_banned"]]
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/copyMessage"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/forwardMessage"
 
     sent = 0
     failed = 0
@@ -272,8 +274,10 @@ PAGE_TEMPLATE = """
   <h2>📝 Посты на публикацию (переслали боту через /newpost)</h2>
   <p style="color:#9aa0aa; font-size:13px; max-width:520px;">
     Отправь боту команду <code>/newpost</code> с аккаунта админа, затем перешли
-    готовый пост (текст и/или фото с подписью) — форматирование Telegram сохранится
-    без искажений. Пост появится здесь, публикуй кнопкой ниже.
+    готовый пост (текст и/или фото с подписью) — форматирование Telegram, включая
+    премиум-эмодзи, сохранится без искажений, потому что публикация идёт через
+    настоящую пересылку (у пользователей будет видна пометка "Переслано от...").
+    Пост появится здесь, публикуй кнопкой ниже.
   </p>
   <table>
     <tr><th>Создан (UTC)</th><th>Превью</th><th>Статус</th><th>Действия</th></tr>
